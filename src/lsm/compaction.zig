@@ -80,11 +80,12 @@ pub const CompactionInfo = struct {
     /// must be skipped by the caller.
     move_table: bool,
 
+    tree_id: u16,
     level_b: u8,
 };
 
 pub const Exhausted = struct { bar: bool, beat: bool };
-const BlipCallback = *const fn (*anyopaque, ?Exhausted) void;
+const BlipCallback = *const fn (*CompactionInfo, ?Exhausted) void;
 pub const BlipStage = enum { read, merge, write, drained };
 
 // The following types need to specalize on Grid, but are used both by CompactionType and the
@@ -214,133 +215,6 @@ pub fn CompactionHelperType(comptime Grid: type) type {
     };
 }
 
-/// Helper for the forest to dynamically dispatch the underlying Compaction type.
-pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype) type {
-    const Helpers = CompactionHelperType(Grid);
-
-    return struct {
-        const Dispatcher = T: {
-            @setEvalBranchQuota(100000); // TODO: Needed for the std.mem.eql below - could be less.
-            var type_info = @typeInfo(union(enum) {});
-
-            // Union fields for each compaction type.
-            for (tree_infos) |tree_info| {
-                const Compaction = tree_info.Tree.Compaction;
-                const type_name = @typeName(Compaction);
-
-                for (type_info.Union.fields) |field| {
-                    if (std.mem.eql(u8, field.name, type_name)) {
-                        break;
-                    }
-                } else {
-                    type_info.Union.fields = type_info.Union.fields ++
-                        [_]std.builtin.Type.UnionField{.{
-                        .name = type_name,
-                        .type = *Compaction,
-                        .alignment = @alignOf(*Compaction),
-                    }};
-                }
-            }
-
-            // We need a tagged union for dynamic dispatching.
-            type_info.Union.tag_type = blk: {
-                const union_fields = type_info.Union.fields;
-                var tag_fields: [union_fields.len]std.builtin.Type.EnumField =
-                    undefined;
-                for (&tag_fields, union_fields, 0..) |*tag_field, union_field, i| {
-                    tag_field.* = .{
-                        .name = union_field.name,
-                        .value = i,
-                    };
-                }
-
-                break :blk @Type(.{ .Enum = .{
-                    .tag_type = std.math.IntFittingRange(0, tag_fields.len - 1),
-                    .fields = &tag_fields,
-                    .decls = &.{},
-                    .is_exhaustive = true,
-                } });
-            };
-
-            break :T @Type(type_info);
-        };
-
-        const Self = @This();
-
-        dispatcher: Dispatcher,
-        info: CompactionInfo,
-
-        pub fn init(info: CompactionInfo, compaction: anytype) @This() {
-            const Compaction = @TypeOf(compaction.*);
-            const type_name = @typeName(Compaction);
-
-            return .{
-                .info = info,
-                .dispatcher = @unionInit(Dispatcher, type_name, compaction),
-            };
-        }
-
-        pub fn bar_setup_budget(
-            self: *const Self,
-            beats_max: u64,
-            target_index_blocks: Helpers.BlockFIFO,
-            source_a_immutable_block: BlockPtr,
-        ) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.bar_setup_budget(
-                    beats_max,
-                    target_index_blocks,
-                    source_a_immutable_block,
-                ),
-            };
-        }
-
-        pub fn beat_grid_reserve(self: *Self) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.beat_grid_reserve(),
-            };
-        }
-
-        pub fn beat_blocks_assign(self: *Self, blocks: Helpers.CompactionBlocks) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.beat_blocks_assign(blocks),
-            };
-        }
-
-        // TODO: Is there a better way to implement dynamic dispatch and callbacks for the methods
-        // below?
-        pub fn blip_read(self: *Self, callback: BlipCallback) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.blip_read(callback, self),
-            };
-        }
-
-        pub fn blip_merge(self: *Self, callback: BlipCallback) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.blip_merge(callback, self),
-            };
-        }
-
-        pub fn blip_write(self: *Self, callback: BlipCallback) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.blip_write(callback, self),
-            };
-        }
-
-        pub fn beat_grid_forfeit(self: *Self) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.beat_grid_forfeit(),
-            };
-        }
-
-        pub fn bar_apply_to_manifest(self: *Self) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.bar_apply_to_manifest(),
-            };
-        }
-    };
-}
-
 pub fn CompactionType(
     comptime Table: type,
     comptime Tree: type,
@@ -465,7 +339,7 @@ pub fn CompactionType(
         const Beat = struct {
             const Read = struct {
                 callback: BlipCallback,
-                ptr: *anyopaque,
+                callback_context: *CompactionInfo,
 
                 pending_reads_index: usize = 0,
                 pending_reads_data: usize = 0,
@@ -476,14 +350,14 @@ pub fn CompactionType(
             };
             const Merge = struct {
                 callback: BlipCallback,
-                ptr: *anyopaque,
+                callback_context: *CompactionInfo,
 
                 next_tick: Grid.NextTick = undefined,
                 timer: std.time.Timer,
             };
             const Write = struct {
                 callback: BlipCallback,
-                ptr: *anyopaque,
+                callback_context: *CompactionInfo,
 
                 pending_writes: usize = 0,
 
@@ -518,7 +392,7 @@ pub fn CompactionType(
                 self: *Beat,
                 stage: BlipStage,
                 callback: BlipCallback,
-                ptr: *anyopaque,
+                callback_context: *CompactionInfo,
             ) void {
                 switch (stage) {
                     .read => {
@@ -526,7 +400,7 @@ pub fn CompactionType(
 
                         self.read = .{
                             .callback = callback,
-                            .ptr = ptr,
+                            .callback_context = callback_context,
                             .timer = std.time.Timer.start() catch unreachable,
                         };
                         self.read.?.timer.reset();
@@ -536,7 +410,7 @@ pub fn CompactionType(
 
                         self.merge = .{
                             .callback = callback,
-                            .ptr = ptr,
+                            .callback_context = callback_context,
                             .timer = std.time.Timer.start() catch unreachable,
                         };
                         self.merge.?.timer.reset();
@@ -546,7 +420,7 @@ pub fn CompactionType(
 
                         self.write = .{
                             .callback = callback,
-                            .ptr = ptr,
+                            .callback_context = callback_context,
                             .timer = std.time.Timer.start() catch unreachable,
                         };
                         self.write.?.timer.reset();
@@ -567,32 +441,32 @@ pub fn CompactionType(
                         assert(self.read.?.pending_reads_data == 0);
 
                         const callback = self.read.?.callback;
-                        const ptr = self.read.?.ptr;
+                        const callback_context = self.read.?.callback_context;
 
                         self.read = null;
 
-                        callback(ptr, exhausted);
+                        callback(callback_context, exhausted);
                     },
                     .merge => {
                         assert(self.merge != null);
 
                         const callback = self.merge.?.callback;
-                        const ptr = self.merge.?.ptr;
+                        const callback_context = self.merge.?.callback_context;
 
                         self.merge = null;
 
-                        callback(ptr, exhausted);
+                        callback(callback_context, exhausted);
                     },
                     .write => {
                         assert(self.write != null);
                         assert(self.write.?.pending_writes == 0);
 
                         const callback = self.write.?.callback;
-                        const ptr = self.write.?.ptr;
+                        const callback_context = self.write.?.callback_context;
 
                         self.write = null;
 
-                        callback(ptr, exhausted);
+                        callback(callback_context, exhausted);
                     },
                     .drained => unreachable,
                 }
@@ -792,6 +666,7 @@ pub fn CompactionType(
                 .target_key_min = compaction.bar.?.range_b.key_min,
                 .target_key_max = compaction.bar.?.range_b.key_max,
                 .move_table = compaction.bar.?.move_table,
+                .tree_id = tree.config.id,
                 .level_b = compaction.level_b,
             };
         }
@@ -934,7 +809,7 @@ pub fn CompactionType(
         /// Perform read IO to fill our source_index_blocks and source_value_blocks with as many
         /// blocks as we can, given their sizes, and where we are in the amount of work we need to
         /// do this beat.
-        pub fn blip_read(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
+        pub fn blip_read(compaction: *Compaction, callback: BlipCallback, callback_context: *CompactionInfo) void {
             log.debug("blip_read({s}): scheduling read IO", .{compaction.tree_config.name});
 
             assert(compaction.bar != null);
@@ -943,7 +818,7 @@ pub fn CompactionType(
 
             const beat = &compaction.beat.?;
 
-            beat.activate_and_assert(.read, callback, ptr);
+            beat.activate_and_assert(.read, callback, callback_context);
 
             if (!beat.index_read_done) {
                 compaction.blip_read_index();
@@ -1236,7 +1111,7 @@ pub fn CompactionType(
         ///
         /// This is not to be confused with blip_merge itself finishing; this can happen at any time
         /// because we need more input values, and that's OK. We hold on to our buffers for a beat.
-        pub fn blip_merge(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
+        pub fn blip_merge(compaction: *Compaction, callback: BlipCallback, callback_context: *CompactionInfo) void {
             log.debug("blip_merge({s}) starting", .{compaction.tree_config.name});
 
             assert(compaction.bar != null);
@@ -1246,7 +1121,7 @@ pub fn CompactionType(
             const bar = &compaction.bar.?;
             const beat = &compaction.beat.?;
 
-            beat.activate_and_assert(.merge, callback, ptr);
+            beat.activate_and_assert(.merge, callback, callback_context);
             const merge = &beat.merge.?;
 
             var source_exhausted_bar = false;
@@ -1801,7 +1676,7 @@ pub fn CompactionType(
         }
 
         /// Perform write IO to write our target_index_blocks and target_value_blocks to disk.
-        pub fn blip_write(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
+        pub fn blip_write(compaction: *Compaction, callback: BlipCallback, callback_context: *CompactionInfo) void {
             assert(compaction.bar != null);
             assert(compaction.beat != null);
             assert(compaction.bar.?.move_table == false);
@@ -1809,7 +1684,7 @@ pub fn CompactionType(
             const bar = &compaction.bar.?;
             const beat = &compaction.beat.?;
 
-            beat.activate_and_assert(.write, callback, ptr);
+            beat.activate_and_assert(.write, callback, callback_context);
 
             assert(beat.write != null);
             const write = &beat.write.?;
